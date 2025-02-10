@@ -1,11 +1,9 @@
 # Import necessary modules and define env variables
 
-from langchain_openai import OpenAIEmbeddings
-#from langchain_community.embeddings.openai import OpenAIEmbeddings
+from sentence_transformers import SentenceTransformer  # Utiliser SentenceTransformers
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
+from langchain.vectorstores import FAISS  # Utiliser FAISS
 from langchain.chains import RetrievalQAWithSourcesChain
-from langchain_community.chat_models import ChatOpenAI
 from langchain.prompts.chat import (
     ChatPromptTemplate,
     SystemMessagePromptTemplate,
@@ -17,14 +15,18 @@ import chainlit as cl
 import PyPDF2
 from io import BytesIO
 
-
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
 
-OPENAI_API_KEY= os.getenv("OPENAI_API_KEY")
+# Classe personnalisée pour utiliser SentenceTransformers
+class CustomEmbeddings:
+    def __init__(self):
+        self.model = SentenceTransformer('all-MiniLM-L6-v2')  # Choisissez un modèle compatible
 
+    def embed_text(self, text):
+        return self.model.encode(text)
 
 # text_splitter and system template
 
@@ -46,7 +48,6 @@ Begin!
 ----------------
 {summaries}"""
 
-
 messages = [
     SystemMessagePromptTemplate.from_template(system_template),
     HumanMessagePromptTemplate.from_template("{question}"),
@@ -54,14 +55,9 @@ messages = [
 prompt = ChatPromptTemplate.from_messages(messages)
 chain_type_kwargs = {"prompt": prompt}
 
-
 @cl.on_chat_start
 async def on_chat_start():
 
-    # Sending an image with the local file path
-    #elements = [
-    #cl.Image(name="image1", display="inline", path="./robot.jpeg")
-    #]
     await cl.Message(content="Hello there, Welcome to AskAnyQuery related to Data!").send()
     files = None
 
@@ -80,12 +76,9 @@ async def on_chat_start():
     await msg.send()
 
     # Read the PDF file
-
     with open(file.path, "rb") as f:
-        pdf_stream = BytesIO(f.read())  # Lire le contenu binaire du fichier
+        pdf_stream = BytesIO(f.read())
 
-    #print(file.path)
-    #pdf_stream = BytesIO(file.path)
     pdf = PyPDF2.PdfReader(pdf_stream)
     pdf_text = ""
     for page in pdf.pages:
@@ -97,19 +90,16 @@ async def on_chat_start():
     # Create metadata for each chunk
     metadatas = [{"source": f"{i}-pl"} for i in range(len(texts))]
 
-    # Create a Chroma vector store
-    embeddings = OpenAIEmbeddings()
-    docsearch = await cl.make_async(Chroma.from_texts)(
-        texts, embeddings, metadatas=metadatas
-    )
+    # Create a FAISS vector store
+    embeddings = CustomEmbeddings()
+    docsearch = FAISS.from_texts(texts, embeddings.embed_text, metadatas=metadatas)
 
-    # Create a chain that uses the Chroma vector store
+    # Create a chain that uses the FAISS vector store
     chain = RetrievalQAWithSourcesChain.from_chain_type(
-        ChatOpenAI(temperature=0),
-        chain_type="stuff",
         retriever=docsearch.as_retriever(),
+        chain_type="stuff",
+        chain_type_kwargs=chain_type_kwargs,
     )
-    
 
     # Save the metadata and texts in the user session
     cl.user_session.set("metadatas", metadatas)
@@ -121,9 +111,8 @@ async def on_chat_start():
 
     cl.user_session.set("chain", chain)
 
-
 @cl.on_message
-async def main(message:str):
+async def main(message: str):
 
     chain = cl.user_session.get("chain")  # type: RetrievalQAWithSourcesChain
     cb = cl.AsyncLangchain_communityCallbackHandler(
@@ -135,7 +124,7 @@ async def main(message:str):
     answer = res["answer"]
     sources = res["sources"].strip()
     source_elements = []
-    
+
     # Get the metadata and texts from the user session
     metadatas = cl.user_session.get("metadatas")
     all_sources = [m["source"] for m in metadatas]
@@ -147,14 +136,12 @@ async def main(message:str):
         # Add the sources to the message
         for source in sources.split(","):
             source_name = source.strip().replace(".", "")
-            # Get the index of the source
             try:
                 index = all_sources.index(source_name)
             except ValueError:
                 continue
             text = texts[index]
             found_sources.append(source_name)
-            # Create the text element referenced in the message
             source_elements.append(cl.Text(content=text, name=source_name))
 
         if found_sources:
