@@ -44,16 +44,16 @@ class CustomEmbeddings(Embeddings):  # Hériter de la classe Embeddings
 
 text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
 
-system_template = """
-Use the following pieces of context to answer the user's question.
-If you can’t find the answer in the context below, use your own knowledge to respond.
-Always mention "Sources" at the end. If the answer is based on the PDF, reference the source.
-If the answer is based on your own knowledge, write "Sources: Model Knowledge".
+system_template = """Use the following pieces of context to answer the user's question.
+If you don't know the answer, just say that you don't know, don't try to make up an answer.
+ALWAYS return a "SOURCES" part in your answer.
+The "SOURCES" part should be a reference to the source of the document from which you got your answer.
+If you don't know the answer, just say that you don't know, don't try to make up an answer.
+give the answer according to the language.for exemple if the question is in french, give the answer in french; if the question is in english, give the answer in english
 
-Context:
-{summaries}
-"""
-
+Begin!
+----------------
+{summaries}"""
 
 messages = [
     SystemMessagePromptTemplate.from_template(system_template),
@@ -65,7 +65,7 @@ chain_type_kwargs = {"prompt": prompt}
 @cl.on_chat_start
 async def on_chat_start():
 
-    await cl.Message(content="Hello there, Welcome to AskAnyQuery related to Data!").send()
+    await cl.Message(content="Hello there, Welcome to Askmesomething related to data").send()
     files = None
 
     # Wait for the user to upload a PDF file
@@ -139,23 +139,50 @@ async def main(message: cl.Message):
         await cl.Message(content="The chain is not initialized. Please restart the chat!").send()
         return
 
+    logging.debug(f"Received message: {message}")
+    logging.debug(f"Chain: {chain}")
+    
     try:
-        # Obtenez une réponse du modèle
+        # Utilisation de `ainvoke` au lieu de `acall`
         res = await chain.ainvoke({"question": message.content})
 
-        answer = res.get("answer", "I don't know.")
+        #print(message.content)
+        # Vérifiez la structure de `res` pour ajuster l'accès
+        answer = res.get("answer", "No answer available.")
         sources = res.get("sources", "").strip()
+        source_elements = []
+
+        # Get the metadata and texts from the user session
+        metadatas = cl.user_session.get("metadatas")
+        all_sources = [m["source"] for m in metadatas]
+
+
+        texts = cl.user_session.get("texts")
 
         if sources:
-            # Si les sources sont disponibles
-            answer += f"\nSources: {sources}"
-        else:
-            # Si aucune source n'est trouvée, utiliser les connaissances générales
-            answer += "\nSources: Model Knowledge"
+            found_sources = []
 
-        await cl.Message(content=answer).send()
+            # Add the sources to the message
+            for source in sources.split(","):
+                source_name = source.strip().replace(".", "").replace("-pl", "").strip()
+                try:
+                    index = all_sources.index(source_name)
+                except ValueError:
+                    continue
+                text = texts[index]
+                found_sources.append(source_name)
+                source_elements.append(cl.Text(content=text, name=source_name))
+
+            if found_sources:
+                answer += f"\nSources: {', '.join(found_sources)}"
+            else:
+                answer += "\nNo sources found"
+
+        #print("All sources in metadata:", all_sources)
+        #print("Sources returned by the model:", sources)
+
+        await cl.Message(content=answer, elements=source_elements).send()
 
     except Exception as e:
         logging.error(f"Error during processing: {e}")
         await cl.Message(content="An error occurred while processing your request.").send()
-
