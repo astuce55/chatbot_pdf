@@ -1,8 +1,9 @@
 # Import necessary modules and define env variables
 
+from langchain.embeddings.base import Embeddings
 from sentence_transformers import SentenceTransformer  # Utiliser SentenceTransformers
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.vectorstores import FAISS  # Utiliser FAISS
+from langchain_community.vectorstores import FAISS  # Utiliser FAISS
 from langchain.chains import RetrievalQAWithSourcesChain
 from langchain.prompts.chat import (
     ChatPromptTemplate,
@@ -14,6 +15,13 @@ import io
 import chainlit as cl
 import PyPDF2
 from io import BytesIO
+from langchain_groq import ChatGroq
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG)
+
+os.environ["GROQ_API_KEY"] = "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"
 
 from dotenv import load_dotenv
 
@@ -21,32 +29,31 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Classe personnalisée pour utiliser SentenceTransformers
-class CustomEmbeddings:
+class CustomEmbeddings(Embeddings):  # Hériter de la classe Embeddings
     def __init__(self):
-        self.model = SentenceTransformer('all-MiniLM-L6-v2')  # Choisissez un modèle compatible
+        self.model = SentenceTransformer('all-MiniLM-L6-v2')
 
-    def embed_text(self, text):
-        return self.model.encode(text)
+    def embed_documents(self, texts):
+        """Encode une liste de textes."""
+        return self.model.encode(texts, convert_to_numpy=True)
 
+    def embed_query(self, text):
+        """Encode une seule requête."""
+        return self.model.encode([text], convert_to_numpy=True)[0]
 # text_splitter and system template
 
 text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
 
-system_template = """Use the following pieces of context to answer the users question.
-If you don't know the answer, just say that you don't know, don't try to make up an answer.
-ALWAYS return a "SOURCES" part in your answer.
-The "SOURCES" part should be a reference to the source of the document from which you got your answer.
+system_template = """
+Use the following pieces of context to answer the user's question.
+If you can’t find the answer in the context below, use your own knowledge to respond.
+Always mention "Sources" at the end. If the answer is based on the PDF, reference the source.
+If the answer is based on your own knowledge, write "Sources: Model Knowledge".
 
-Example of your response should be:
+Context:
+{summaries}
+"""
 
-```
-The answer is foo
-SOURCES: xyz
-```
-
-Begin!
-----------------
-{summaries}"""
 
 messages = [
     SystemMessagePromptTemplate.from_template(system_template),
@@ -91,11 +98,24 @@ async def on_chat_start():
     metadatas = [{"source": f"{i}-pl"} for i in range(len(texts))]
 
     # Create a FAISS vector store
+    # Encodage des textes
     embeddings = CustomEmbeddings()
-    docsearch = FAISS.from_texts(texts, embeddings.embed_text, metadatas=metadatas)
+    encoded_texts = embeddings.embed_documents(texts)  # Produit un tableau numpy
+
+    # Création du vectorstore FAISS
+    docsearch = FAISS.from_texts(
+        texts,
+        embedding=embeddings,  # Passer les vecteurs déjà encodés
+        metadatas=metadatas
+    )
+
+
+    # Créer une instance du LLM
+    llm = ChatGroq(temperature=0)  # Configurez ChatGroq
 
     # Create a chain that uses the FAISS vector store
     chain = RetrievalQAWithSourcesChain.from_chain_type(
+        llm=llm,
         retriever=docsearch.as_retriever(),
         chain_type="stuff",
         chain_type_kwargs=chain_type_kwargs,
@@ -111,46 +131,31 @@ async def on_chat_start():
 
     cl.user_session.set("chain", chain)
 
+
 @cl.on_message
-async def main(message: str):
-
+async def main(message: cl.Message):
     chain = cl.user_session.get("chain")  # type: RetrievalQAWithSourcesChain
-    cb = cl.AsyncLangchain_communityCallbackHandler(
-        stream_final_answer=True, answer_prefix_tokens=["FINAL", "ANSWER"]
-    )
-    cb.answer_reached = True
-    res = await chain.acall(message, callbacks=[cb])
+    if not chain:
+        await cl.Message(content="The chain is not initialized. Please restart the chat!").send()
+        return
 
-    answer = res["answer"]
-    sources = res["sources"].strip()
-    source_elements = []
+    try:
+        # Obtenez une réponse du modèle
+        res = await chain.ainvoke({"question": message.content})
 
-    # Get the metadata and texts from the user session
-    metadatas = cl.user_session.get("metadatas")
-    all_sources = [m["source"] for m in metadatas]
-    texts = cl.user_session.get("texts")
+        answer = res.get("answer", "I don't know.")
+        sources = res.get("sources", "").strip()
 
-    if sources:
-        found_sources = []
-
-        # Add the sources to the message
-        for source in sources.split(","):
-            source_name = source.strip().replace(".", "")
-            try:
-                index = all_sources.index(source_name)
-            except ValueError:
-                continue
-            text = texts[index]
-            found_sources.append(source_name)
-            source_elements.append(cl.Text(content=text, name=source_name))
-
-        if found_sources:
-            answer += f"\nSources: {', '.join(found_sources)}"
+        if sources:
+            # Si les sources sont disponibles
+            answer += f"\nSources: {sources}"
         else:
-            answer += "\nNo sources found"
+            # Si aucune source n'est trouvée, utiliser les connaissances générales
+            answer += "\nSources: Model Knowledge"
 
-    if cb.has_streamed_final_answer:
-        cb.final_stream.elements = source_elements
-        await cb.final_stream.update()
-    else:
-        await cl.Message(content=answer, elements=source_elements).send()
+        await cl.Message(content=answer).send()
+
+    except Exception as e:
+        logging.error(f"Error during processing: {e}")
+        await cl.Message(content="An error occurred while processing your request.").send()
+
